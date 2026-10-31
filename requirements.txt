@@ -1,0 +1,12 @@
+# Paket untuk dashboard online (Streamlit Community Cloud).
+# Selenium/Chrome tidak diperlukan karena scraping hanya berjalan di komputer kantor.
+streamlit>=1.50
+pandas
+altair
+plotly
+openpyxl
+matplotlib
+reportlab
+python-docx
+gspread>=6
+google-auth
