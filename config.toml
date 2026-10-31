@@ -1,0 +1,10 @@
+[theme.light]
+primaryColor = "#6C007D"
+backgroundColor = "#F5F6F8"
+secondaryBackgroundColor = "#EDE7F0"
+
+[theme.dark]
+primaryColor = "#C77DD6"
+
+[browser]
+gatherUsageStats = false
