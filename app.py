@@ -305,16 +305,39 @@ def gabung(files):
     return df
 
 
+class PerubahanTertunda(Exception):
+    """Sebagian file hasil tidak bisa ditulis karena sedang dibuka di Excel/OneDrive."""
+
+    def __init__(self, terkunci, n_file):
+        self.terkunci, self.n_file = terkunci, n_file
+        super().__init__(
+            f"File {', '.join(terkunci)} sedang dibuka di Microsoft Excel (atau sedang disinkronkan "
+            "OneDrive), sehingga perubahan belum tersimpan di file tersebut"
+            + (f" ({n_file} file lain sudah tersimpan)" if n_file else "")
+            + ". Tutup file itu di Excel, lalu klik Simpan lagi. Dashboard online belum diperbarui.")
+
+
+def _tulis(path, data):
+    """Tulis file hasil; memakai sc.tulis_file (coba ulang, error jelas) bila tersedia."""
+    tulis = getattr(sc, "tulis_file", None)
+    if tulis:
+        return tulis(path, data)
+    path.write_bytes(data)
+
+
 def terapkan_perubahan(edit=None, hapus=()):
     """Simpan koreksi/penghapusan ke SEMUA file hasil yang memuat link tersebut,
-    lalu teruskan ke Google Sheet dashboard online (bila sudah diatur)."""
+    lalu teruskan ke Google Sheet dashboard online (bila sudah diatur).
+    Bila ada file yang sedang dibuka di Excel, file lain tetap disimpan, Google Sheet tidak
+    diperbarui, dan PerubahanTertunda dinaikkan supaya pemanggil bisa memberi tahu pengguna.
+    Menyimpan ulang perubahan yang sama aman (hasilnya sama)."""
     ubah = {}
     if edit is not None and len(edit):
         for r in edit.to_dict("records"):
             ubah[sc.kunci_link(r["Link"])] = r
     hapus_k = {sc.kunci_link(x) for x in hapus}
     judul_hapus = {}
-    n_file = 0
+    n_file, terkunci = 0, []
     for path in daftar_file():
         df = baca_excel(path)
         k = df["Link"].map(sc.kunci_link)
@@ -335,8 +358,14 @@ def terapkan_perubahan(edit=None, hapus=()):
             df["Ritel"] = df["Ritel"].fillna("").astype(str).map(lambda v: ", ".join(sc.daftar_seri(v)))
             df["Bulan"] = df["Tanggal"].apply(sc.nama_bulan)
             df = df.sort_values("Tanggal", ascending=True, na_position="last", kind="stable").reset_index(drop=True)
-            path.write_bytes(sc.excel_bytes(df))
-            n_file += 1
+            try:
+                _tulis(path, sc.excel_bytes(df))
+                n_file += 1
+            except PermissionError:   # termasuk sc.FileTerkunci
+                terkunci.append(path.name)
+    if terkunci:
+        _baca.clear()
+        raise PerubahanTertunda(terkunci, n_file)
     sinkron_online(list(ubah.values()),
                    [{"Link": x, "Judul": judul_hapus.get(sc.kunci_link(x), "")} for x in hapus])
     return n_file
@@ -609,18 +638,26 @@ def dialog_edit(r, opsi_topik):
     ritel = c5.text_input("Ritel (seri)", r["Ritel"], placeholder="mis. SR025, ST015",
                           help="Pisahkan dengan koma bila lebih dari satu.")
     if st.button("💾 Simpan", type="primary"):
-        terapkan_perubahan(pd.DataFrame([{
-            "Link": r["Link"], "Judul": judul, "Situs": situs,
-            "Tanggal": pd.Timestamp(tgl) if tgl else pd.NaT, "Topik": topik or r["Topik"],
-            "Tone": tone, "Ritel": ", ".join(sc.daftar_seri(ritel))}]))
-        ss["toast"] = "Perubahan berita disimpan"
-        st.rerun()
+        try:
+            terapkan_perubahan(pd.DataFrame([{
+                "Link": r["Link"], "Judul": judul, "Situs": situs,
+                "Tanggal": pd.Timestamp(tgl) if tgl else pd.NaT, "Topik": topik or r["Topik"],
+                "Tone": tone, "Ritel": ", ".join(sc.daftar_seri(ritel))}]))
+        except PerubahanTertunda as e:
+            st.error(f"⚠️ {e}")
+        else:
+            ss["toast"] = "Perubahan berita disimpan"
+            st.rerun()
     st.divider()
     yakin = st.checkbox("Saya ingin menghapus berita ini dari data hasil")
     if st.button("🗑️ Hapus berita", disabled=not yakin):
-        terapkan_perubahan(hapus=[r["Link"]])
-        ss["toast"] = "Berita dihapus"
-        st.rerun()
+        try:
+            terapkan_perubahan(hapus=[r["Link"]])
+        except PerubahanTertunda as e:
+            st.error(f"⚠️ {e}")
+        else:
+            ss["toast"] = "Berita dihapus"
+            st.rerun()
 
 
 def kartu_berita(df, kunci, per_halaman=15, edit=True):
@@ -678,10 +715,15 @@ def tabel_edit(df, kunci):
     if st.button(label, type="primary", disabled=not (n_ubah or n_hapus), key=f"simpan_{kunci}"):
         e = edit[berubah].copy()
         e["Tanggal"] = pd.to_datetime(e["Tanggal"], errors="coerce")
-        terapkan_perubahan(e, hapus=edit.loc[edit["Hapus"], "Link"].tolist())
-        ss["toast"] = f"{n_ubah} berita diubah, {n_hapus} dihapus"
-        ss["ver"] += 1
-        st.rerun()
+        try:
+            terapkan_perubahan(e, hapus=edit.loc[edit["Hapus"], "Link"].tolist())
+        except PerubahanTertunda as err:
+            # Isian tabel tidak dikosongkan, jadi cukup tutup file di Excel lalu klik Simpan lagi
+            st.error(f"⚠️ {err}")
+        else:
+            ss["toast"] = f"{n_ubah} berita diubah, {n_hapus} dihapus"
+            ss["ver"] += 1
+            st.rerun()
 
 
 def csv_bytes(df):
@@ -1216,15 +1258,24 @@ def halaman_kelola():
                        "versi lain memakai link pengalihan Google (news.google.com), atau versi AMP/mobile "
                        "dari artikel yang sama. Versi link asli dan koreksi yang sudah ada dipertahankan.")
             if st.button("Rapikan semua file", key="bersih_dup"):
-                total, rincian = 0, []
+                total, rincian, terkunci = 0, [], []
                 for p in files:
-                    n = sc.bersihkan_file(p, ss.get("gabung_judul_sama", sc.GABUNG_JUDUL_SAMA))
+                    try:
+                        n = sc.bersihkan_file(p, ss.get("gabung_judul_sama", sc.GABUNG_JUDUL_SAMA))
+                    except PermissionError:   # file sedang dibuka di Excel/OneDrive
+                        terkunci.append(p.name)
+                        continue
                     total += n
                     if n:
                         rincian.append(f"{p.name}: {n}")
-                ss["toast"] = ((f"{total} berita ganda dibuang ({'; '.join(rincian)}). " if total
-                                else "Tidak ada duplikat. ") + "Semua file kini urut dari tanggal terlama.")
-                st.rerun()
+                pesan = ((f"{total} berita ganda dibuang ({'; '.join(rincian)}). " if total
+                          else "Tidak ada duplikat. ") + "File lain kini urut dari tanggal terlama.")
+                if terkunci:
+                    st.warning(f"⚠️ {pesan} File berikut dilewati karena sedang dibuka di Excel/OneDrive: "
+                               f"{', '.join(terkunci)}. Tutup file itu, lalu klik Rapikan lagi.")
+                else:
+                    ss["toast"] = pesan.replace("File lain", "Semua file")
+                    st.rerun()
     sampah_dir = sc.FOLDER_HASIL / "_sampah"
     if files:
         hapus_file = st.multiselect("Pilih file yang akan dihapus", [p.name for p in files],
@@ -1376,12 +1427,17 @@ def halaman_usulan():
                          help=None if bisa else "Berita tidak ada di data lokal; hanya bisa ditolak."):
                 try:
                     setujui_usulan(u, r)
-                    us.putuskan(us.buka(), u["ID"], us.DISETUJUI, oleh, catatan)
-                    ss["toast"] = f"Usulan {u['ID']} disetujui dan diterapkan."
-                except Exception as e:
-                    ss["toast"] = f"Usulan diterapkan ke data lokal, tetapi status gagal dicatat: {e}"
-                muat_usulan.clear()
-                st.rerun()
+                except PerubahanTertunda as e:
+                    # Status usulan tetap "Menunggu" supaya bisa disetujui lagi setelah file ditutup
+                    st.error(f"⚠️ Usulan belum disetujui. {e}")
+                else:
+                    try:
+                        us.putuskan(us.buka(), u["ID"], us.DISETUJUI, oleh, catatan)
+                        ss["toast"] = f"Usulan {u['ID']} disetujui dan diterapkan."
+                    except Exception as e:
+                        ss["toast"] = f"Usulan diterapkan ke data lokal, tetapi status gagal dicatat: {e}"
+                    muat_usulan.clear()
+                    st.rerun()
             if b2.button("❌ Tolak", key=f"tolak_{u['ID']}"):
                 try:
                     us.putuskan(us.buka(), u["ID"], us.DITOLAK, oleh, catatan)

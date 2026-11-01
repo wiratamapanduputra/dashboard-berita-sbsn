@@ -843,6 +843,30 @@ def nama_file(dari, sampai, seri=""):
     return f"berita_sbsn_{periode}{akhiran}.xlsx"
 
 
+class FileTerkunci(PermissionError):
+    """File hasil tidak bisa ditulis, biasanya karena sedang dibuka di Excel."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        super().__init__(
+            f"File {self.path.name} sedang dibuka di program lain (biasanya Microsoft Excel) atau "
+            "sedang disinkronkan OneDrive, sehingga tidak bisa disimpan. Tutup file tersebut di "
+            "Excel, lalu ulangi.")
+
+
+def tulis_file(path, data, coba=4, jeda=1.5):
+    """Tulis file; bila terkunci (Windows: file dibuka di Excel), coba lagi beberapa kali."""
+    path = Path(path)
+    for k in range(coba):
+        try:
+            path.write_bytes(data)
+            return path
+        except PermissionError:
+            if k == coba - 1:
+                raise FileTerkunci(path) from None
+            time.sleep(jeda)
+
+
 def gabung_dengan_lama(lama, baru, gabung_judul_sama=None):
     """Gabungkan hasil baru ke data lama. Data lama (termasuk koreksi tone/seri) diutamakan.
 
@@ -875,7 +899,7 @@ def bersihkan_file(path, gabung_judul_sama=None):
         urutkan_tanggal(df)["Tanggal"].reset_index(drop=True))
     if dibuang or urutan_berubah:
         bersih = bersih.sort_values("Tanggal", ascending=True, na_position="last", kind="stable").reset_index(drop=True)
-        Path(path).write_bytes(excel_bytes(bersih))
+        tulis_file(path, excel_bytes(bersih))
     return dibuang
 
 
@@ -886,14 +910,29 @@ def simpan_excel(df, dari, sampai, seri="", gabung=True, gabung_judul_sama=None)
     itu (berita yang sudah ada tidak digandakan, koreksi lama tetap). Jadi pengambilan berulang
     untuk periode yang sama makin melengkapi data, bukan menimpanya.
     Mengembalikan (path, jumlah_berita_baru, jumlah_total).
+
+    Bila file tujuan sedang dibuka di Excel (terkunci), hasil TIDAK hilang: disimpan ke file
+    cadangan bernama sama + jam (misalnya ..._cadangan_143005.xlsx) dan peringatan ditambahkan ke
+    df.attrs["peringatan"].
     """
     FOLDER_HASIL.mkdir(exist_ok=True)
+    peringatan = df.attrs.setdefault("peringatan", [])
     path = FOLDER_HASIL / nama_file(dari, sampai, seri)
     n_baru = len(df)
     if gabung and path.exists():
         lama = pd.read_excel(path)
         df, n_baru = gabung_dengan_lama(lama, df, gabung_judul_sama)
-    path.write_bytes(excel_bytes(df))
+    data = excel_bytes(df)
+    try:
+        tulis_file(path, data)
+    except FileTerkunci:
+        cadangan = path.with_name(f"{path.stem}_cadangan_{datetime.now():%H%M%S}{path.suffix}")
+        tulis_file(cadangan, data)
+        peringatan.append(
+            f"File {path.name} sedang dibuka di Excel (atau sedang disinkronkan OneDrive), jadi hasil "
+            f"disimpan ke file cadangan {cadangan.name}. Data tidak hilang dan tetap tampil di "
+            "Dashboard. Lain kali tutup file hasil di Excel sebelum mengambil berita.")
+        path = cadangan
     return path, n_baru, len(df)
 
 
