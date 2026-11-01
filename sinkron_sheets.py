@@ -210,38 +210,54 @@ def ke_baris(r, waktu):
 
 
 def pilih_baru(df, lama, dihapus):
-    """Baris df yang belum ada di Sheet (link sama, atau versi RSS dari judul+situs yang sama)
-    dan tidak ada di tab Dihapus. Mengembalikan list baris siap tulis."""
-    kunci_ada = set(lama["Link"].map(sc.kunci_link)) if "Link" in lama else set()
+    """Baris df yang belum ada di Sheet dan tidak ada di tab Dihapus. Mengembalikan list baris
+    siap tulis.
+
+    Aturan "berita sama" dibuat SAMA PERSIS dengan aplikasi admin (sc.buang_duplikat), supaya
+    jumlah berita di dashboard online sama dengan di komputer:
+      - link sama (setelah dibakukan) = berita sama;
+      - link pengalihan Google (news.google.com / google.com/goto) dianggap sama dengan berita
+        lain hanya bila judulnya cocok (minimal 25 huruf), situsnya sama, dan tanggalnya
+        berselisih paling lama 7 hari.
+    Dulu cukup judul + situs sama, sehingga dua berita berbeda dengan judul pendek yang sama
+    (misalnya dua halaman berjudul "BCA Sekuritas") hanya terunggah satu.
+    """
+    if df is None or df.empty:
+        return []
+    kolom = ["Tanggal", "Situs", "Judul", "Link", "Topik", "Tone", "Ritel"]
+
+    def siapkan(d, tanda_lama):
+        d = d.copy()
+        for k in kolom:
+            if k not in d.columns:
+                d[k] = ""
+        d = d[kolom].copy()
+        for k in kolom[1:]:
+            d[k] = d[k].map(_teks)
+        d["Tanggal"] = (_tanggal(d["Tanggal"].astype(str).str.slice(0, 10)) if tanda_lama
+                        else pd.to_datetime(d["Tanggal"], errors="coerce"))
+        d["_lama"] = tanda_lama
+        return d[d["Link"] != ""]
+
+    baru_d = siapkan(df, False)
+    lama_d = siapkan(lama, True) if len(lama) else baru_d.iloc[0:0]
+    kunci_ada = set(lama_d["Link"].map(sc.kunci_link))
     if "Link" in dihapus:
         kunci_ada |= set(dihapus["Link"].map(sc.kunci_link))
-    js_ada = {}
-    if {"Judul", "Situs", "Link"} <= set(lama.columns):
-        for j, s, l in zip(lama["Judul"], lama["Situs"], lama["Link"]):
-            js_ada[_js(j, s)] = js_ada.get(_js(j, s), False) or _rss(l)
-    js_hapus = set()
-    if {"Judul"} <= set(dihapus.columns):
-        js_hapus = {str(j).strip().lower() for j in dihapus["Judul"] if str(j).strip()}
+    judul_hapus = set()
+    if "Judul" in dihapus:
+        judul_hapus = {sc.kunci_judul(j) for j in dihapus["Judul"]}
+        judul_hapus = {j for j in judul_hapus if len(j) >= 25}
 
+    gab = sc.buang_duplikat(pd.concat([lama_d, baru_d], ignore_index=True))
+    pilih = gab[~gab["_lama"].astype(bool)]
+    pilih = pilih[~pilih["Link"].map(sc.kunci_link).isin(kunci_ada)]
+    # Versi link pengalihan dari berita yang sudah dihapus (judul panjang sama) tidak diunggah lagi
+    sudah_dihapus = [bool(sc.adalah_pengalihan(l)) and sc.kunci_judul(j) in judul_hapus
+                     for l, j in zip(pilih["Link"], pilih["Judul"])]
+    pilih = pilih[[not x for x in sudah_dihapus]]
     waktu = sekarang_wib()
-    baru = []
-    for r in df.to_dict("records"):
-        link = _teks(r.get("Link"))
-        if not link:
-            continue
-        k = sc.kunci_link(link)
-        if k in kunci_ada:
-            continue
-        js = _js(_teks(r.get("Judul")), _teks(r.get("Situs")))
-        # Berita yang sama bisa datang dari halaman Google (link asli) dan RSS (link pengalihan)
-        if js in js_ada and (_rss(link) or js_ada[js]):
-            continue
-        if _rss(link) and js[0] in js_hapus:
-            continue
-        kunci_ada.add(k)
-        js_ada[js] = js_ada.get(js, False) or _rss(link)
-        baru.append(ke_baris(r, waktu))
-    return baru
+    return [ke_baris(r, waktu) for r in pilih.to_dict("records")]
 
 
 def perbarui_info(sh, jumlah):

@@ -97,6 +97,10 @@ JEDA_RSS = (2, 4)      # jeda acak (detik) antar permintaan RSS
 #            semuanya ikut dihitung dalam rekapitulasi (walau judul & situsnya sama).
 #   True  -> selain link sama, berita dengan judul DAN situs yang sama juga dianggap duplikat.
 GABUNG_JUDUL_SAMA = False
+# Berita berlink pengalihan Google dianggap sama dengan berita lain berjudul & bersitus sama bila
+# tanggalnya berselisih paling lama sekian hari. Tanggal dari halaman Google sering hanya
+# perkiraan ("3 minggu lalu") yang lalu digeser ke akhir periode, sehingga bisa meleset 2-3 minggu.
+HARI_SAMA_PENGALIHAN = 31
 TUNGGU_CAPTCHA = 600   # detik maksimum menunggu verifikasi Google
 
 KOLOM = ["No", "Tanggal", "Situs", "Judul", "Link", "Topik", "Bulan", "Tone", "Ritel"]
@@ -764,13 +768,18 @@ def buang_duplikat(df, gabung_judul_sama=None):
     rss = {i: adalah_pengalihan(df.at[i, "Link"]) for i in idx}
     lama = {i: bool(df.at[i, "_lama"]) if "_lama" in df.columns else False for i in idx}
     tgl = {i: df.at[i, "Tanggal"] for i in idx}
+    # Tanggal dari RSS Google News (news.google.com) adalah tanggal terbit pasti
+    pasti = {i: "news.google.com" in str(df.at[i, "Link"]) for i in idx}
 
-    def dekat(a, b):
-        return pd.isna(a) or pd.isna(b) or abs((pd.Timestamp(a) - pd.Timestamp(b)).days) <= 7
+    def dekat(a, b, batas):
+        return pd.isna(a) or pd.isna(b) or abs((pd.Timestamp(a) - pd.Timestamp(b)).days) <= batas
 
     def sama(i, j):
+        # Judul pendek/umum (misalnya hanya "BCA Sekuritas") lebih mungkin dipakai beberapa
+        # halaman berbeda, jadi hanya disatukan bila tanggalnya berdekatan (7 hari)
+        batas = HARI_SAMA_PENGALIHAN if min(len(jd[i]), len(jd[j])) >= 25 else 7
         return (judul_cocok(jd[i], jd[j]) and situs_cocok(df.at[i, "Situs"], df.at[j, "Situs"])
-                and dekat(tgl[i], tgl[j]))
+                and dekat(tgl[i], tgl[j], batas))
 
     buang, rss_simpan = set(), []
     asli = [i for i in idx if not rss[i]]
@@ -788,14 +797,23 @@ def buang_duplikat(df, gabung_judul_sama=None):
             else:
                 df.at[j, "Ritel"] = _gabung_ritel(df.at[j, "Ritel"], df.at[i, "Ritel"])
                 kira_j = bool(df.at[j, "_kira"]) if "_kira" in df.columns else False
-                if pd.isna(df.at[j, "Tanggal"]) or kira_j:
+                if pd.isna(df.at[j, "Tanggal"]) or kira_j or (pasti[i] and not lama[j]):
                     if pd.notna(tgl[i]):
                         df.at[j, "Tanggal"] = tgl[i]      # tanggal pasti dari RSS
                 buang.add(i)
             continue
         pasangan = next((j for j in rss_simpan if sama(i, j)), None)
         if pasangan is not None:
-            df.at[pasangan, "Ritel"] = _gabung_ritel(df.at[pasangan, "Ritel"], df.at[i, "Ritel"])
+            j = pasangan
+            df.at[j, "Ritel"] = _gabung_ritel(df.at[j, "Ritel"], df.at[i, "Ritel"])
+            # Pakai tanggal terbaik: tanggal pasti RSS, atau yang lebih awal bila keduanya perkiraan
+            # (perkiraan yang digeser ke akhir periode selalu lebih lambat dari tanggal aslinya)
+            if not lama[j] and pd.notna(tgl[i]):
+                kini = df.at[j, "Tanggal"]
+                if pd.isna(kini) or (pasti[i] and not pasti[j]) or (
+                        pasti[i] == pasti[j] and pd.Timestamp(tgl[i]) < pd.Timestamp(kini)):
+                    df.at[j, "Tanggal"] = tgl[i]
+                    pasti[j] = pasti[j] or pasti[i]
             buang.add(i)
         else:
             rss_simpan.append(i)
