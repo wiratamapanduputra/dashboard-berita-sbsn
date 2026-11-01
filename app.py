@@ -392,6 +392,36 @@ def sinkron_online(ubah=(), hapus=()):
         ss["pesan_sinkron"] = sk.catat_perubahan(ubah, hapus)
 
 
+def unggah_online(df, label="berita"):
+    """Unggah berita yang belum ada ke Google Sheet dashboard online (berita lama & koreksi di
+    Sheet tidak ditimpa). Tidak melakukan apa pun bila dashboard online belum diatur.
+    Hasilnya disimpan di ss["pesan_sinkron"] supaya tampil sebagai pemberitahuan."""
+    try:
+        import sinkron_sheets as sk
+        aktif, alasan = sk.status_online()
+    except Exception as e:
+        aktif, alasan = False, f"modul sinkron_sheets tidak dapat dipakai ({e})"
+    if not aktif:
+        if alasan:
+            ss["pesan_sinkron"] = (False, f"Dashboard online tidak diperbarui. {alasan}")
+        return None
+    try:
+        with st.spinner("Mengunggah ke dashboard online…"):
+            sh = sk.buka()
+            try:
+                sk.kirim_antrean(sh, log=lambda *_: None)
+            except Exception:
+                pass   # antrean koreksi dicoba lagi nanti; unggah berita tetap jalan
+            n = sk.unggah(df, sh, log=lambda *_: None)
+        ss["pesan_sinkron"] = (True, f"Dashboard online diperbarui: {n} {label} baru ditambahkan.")
+        return n
+    except Exception as e:
+        ss["pesan_sinkron"] = (False, f"Data tersimpan di komputer, tetapi gagal diunggah ke dashboard "
+                                      f"online ({e}). Klik ⬆️ Unggah semua data lokal di sidebar "
+                                      "untuk mencoba lagi.")
+        return None
+
+
 def daftar_seri_df(df):
     return sorted({x for v in df["Ritel"] for x in v.split(", ") if x})
 
@@ -820,16 +850,27 @@ def halaman_ambil():
     with st.expander("🌐 Situs media tujuan (opsional)", expanded=bool(ss.get("ab_situs"))):
         st.caption("Kosongkan untuk mengambil dari semua situs yang muncul di Google Berita. "
                    "Situs yang diisi akan dicari secara khusus (site:…) **sebagai tambahan**, "
-                   "sehingga berita dari situs tersebut lebih lengkap.")
+                   "sehingga berita dari situs tersebut lebih lengkap. Isian bawaan = situs "
+                   "**Lapis 1** di file `daftar_situs.csv`; situs Lapis X di file itu otomatis "
+                   "dibuang dari hasil.")
         s1, s2 = st.columns(2)
         ss.setdefault("ab_situs", "\n".join(sc.SITUS_TUJUAN))
         situs = sc.daftar_situs(s1.text_area(
-            "Situs tujuan (satu per baris)", key="ab_situs", height=150,
+            "Situs tujuan / Lapis 1 (satu per baris)", key="ab_situs", height=150,
             placeholder="kontan.co.id\ncnbcindonesia.com\nbisnis.com\nantaranews.com"))
         ss.setdefault("ab_kecuali", "\n".join(sc.SITUS_DIKECUALIKAN))
         kecuali = sc.daftar_situs(s2.text_area(
             "Situs dikecualikan (satu per baris)", key="ab_kecuali", height=150,
             placeholder="contoh-agregator.com"))
+        n_pantau = len(getattr(sc, "SITUS_PEMANTAUAN", []))
+        ss.setdefault("ab_pantau", False)
+        pantau = st.checkbox(
+            f"Sertakan situs pemantauan (Lapis 2: {n_pantau} situs, dicari berkelompok)",
+            key="ab_pantau", disabled=not n_pantau,
+            help="Daftar Lapis 1 (kolom kiri) dan Lapis 2 diatur di file daftar_situs.csv. "
+                 "Disarankan dicentang seminggu sekali atau saat menyusun laporan bulanan.")
+        if pantau:
+            situs = situs + [x for x in sc.SITUS_PEMANTAUAN if x not in situs]
         ss.setdefault("ab_hanya_situs", False)
         hanya_situs = st.checkbox("Hanya ambil berita dari situs tujuan", key="ab_hanya_situs",
                                   disabled=not situs)
@@ -884,6 +925,12 @@ def halaman_ambil():
             status.update(label=(f"Selesai: {len(hasil)} berita terambil · {n_baru} berita baru · "
                                  f"total {n_total} berita di {path.name}"),
                           state="complete", expanded=False)
+        # Teruskan ke dashboard online: seluruh isi file periode ini (berita yang sudah ada di
+        # Google Sheet dilewati, jadi aman diulang dan sekaligus menyusulkan yang tertinggal)
+        unggah_online(baca_excel(path))
+        if "pesan_sinkron" in ss:
+            ok, pesan_s = ss.pop("pesan_sinkron")
+            (st.info if ok else st.warning)(("☁️ " if ok else "⚠️ ") + pesan_s)
         for pesan in peringatan:
             st.warning(f"⚠️ {pesan}")
         if not peringatan:
@@ -1516,6 +1563,13 @@ with st.sidebar:
         else:
             st.caption("☁️ Koreksi dan penghapusan berita otomatis diteruskan ke Google Sheet "
                        "dashboard online.")
+        with st.expander("⬆️ Unggah semua data lokal ke dashboard"):
+            st.caption("Menambahkan ke Google Sheet semua berita di folder hasil yang belum ada di "
+                       "sana (sama dengan unggah_ke_dashboard.bat). Berita yang sudah ada dan "
+                       "koreksi di Sheet tidak diubah. Hasil Ambil berita kini otomatis diunggah.")
+            if st.button("Unggah sekarang", key="unggah_semua"):
+                unggah_online(gabung(daftar_file()))
+                st.rerun()
         with st.expander("🔁 Samakan Google Sheet dengan data lokal"):
             st.caption("Menyusulkan koreksi dan penghapusan (termasuk usulan yang sudah disetujui) "
                        "yang belum sampai ke Google Sheet. Data lokal menjadi acuan; koreksi yang "

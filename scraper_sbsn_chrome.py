@@ -11,6 +11,9 @@ Cara pakai (dari terminal, venv aktif):
     python scraper_sbsn_chrome.py --seri SR025 ST015 --hanya-seri  # berita seri itu saja
     python scraper_sbsn_chrome.py --situs kontan.co.id bisnis.com   # + pencarian khusus situs
     python scraper_sbsn_chrome.py --situs kontan.co.id --hanya-situs  # hanya situs tersebut
+    python scraper_sbsn_chrome.py --pemantauan             # + situs Lapis 2 di daftar_situs.csv
+
+Situs tujuan bawaan diambil dari daftar_situs.csv (Lapis 1), bila file itu ada.
 
 Atau lewat platform:  streamlit run app.py
 
@@ -57,9 +60,20 @@ MAKS_HALAMAN_SITUS = 5 # batas halaman untuk pencarian khusus situs tujuan
 
 # Situs media tujuan (opsional). Kosong = semua situs yang muncul di Google Berita.
 # Contoh: SITUS_TUJUAN = ["kontan.co.id", "cnbcindonesia.com", "bisnis.com"]
+# Bila dibiarkan kosong dan file daftar_situs.csv ada, situs Lapis 1 di file itu yang dipakai.
 SITUS_TUJUAN = []
+# Situs pemantauan (Lapis 2): dicari berkelompok hanya bila diminta (pilihan di aplikasi,
+# atau python jadwal_scraping.py --pemantauan). Kosong = diambil dari daftar_situs.csv.
+SITUS_PEMANTAUAN = []
 # Situs yang tidak ingin diambil beritanya. Contoh: ["contoh-agregator.com"]
+# (Situs Lapis X di daftar_situs.csv juga dibuang dari hasil, tanpa perlu ditulis di sini.)
 SITUS_DIKECUALIKAN = []
+# Daftar situs berlapis (bisa diedit di Excel). Kolom wajib: Situs;Lapis
+#   Lapis 1 = prioritas, dicari khusus setiap pengambilan
+#   Lapis 2 = pemantauan, dicari khusus bila diminta (misalnya seminggu sekali)
+#   Lapis 3 = rujukan saja, tidak dicari khusus (tetap tertangkap lewat pencarian umum)
+#   Lapis X = dikecualikan (toko, broker, iklan), beritanya tidak disimpan
+FILE_DAFTAR_SITUS = FOLDER / "daftar_situs.csv"
 # Cara mencari situs tujuan:
 #   "rss"    -> lewat RSS Google News, satu permintaan ringan per situs (DISARANKAN; tidak membuka
 #               Chrome dan jauh lebih jarang diblokir)
@@ -68,6 +82,9 @@ SITUS_DIKECUALIKAN = []
 SUMBER_SITUS = "rss"
 # Untuk SUMBER_SITUS = "google": jumlah situs per pencarian gabungan
 SITUS_PER_KUERI = 6
+# Untuk SUMBER_SITUS = "rss": jumlah situs per permintaan RSS (site:a OR site:b ...).
+# 1 = satu situs per permintaan (cara lama). 8 membuat 49 situs cukup 7 permintaan per kata kunci.
+SITUS_PER_RSS = 8
 # Selain halaman Google, setiap kata kunci juga dicari lewat RSS Google News (satu permintaan
 # ringan). Ini menambah cakupan dan memberi TANGGAL TERBIT PASTI untuk berita yang di halaman
 # Google hanya tertulis "3 minggu lalu" / "1 bulan lalu".
@@ -348,13 +365,65 @@ def daftar_situs(teks):
     return hasil
 
 
+def muat_daftar_situs(path=None):
+    """Baca daftar_situs.csv -> {"1": [...], "2": [...], "3": [...], "X": [...]}.
+    File boleh dipisah titik koma atau koma (CSV dari Excel Indonesia memakai titik koma)."""
+    path = Path(path or FILE_DAFTAR_SITUS)
+    hasil = {"1": [], "2": [], "3": [], "X": []}
+    if not path.exists():
+        return hasil
+    try:
+        d = pd.read_csv(path, sep=None, engine="python", dtype=str, encoding="utf-8-sig")
+    except Exception as e:
+        print(f"Peringatan: {path.name} tidak dapat dibaca ({e}).")
+        return hasil
+    kol = {c.strip().lower(): c for c in d.columns}
+    if "situs" not in kol or "lapis" not in kol:
+        print(f"Peringatan: {path.name} harus punya kolom 'Situs' dan 'Lapis'.")
+        return hasil
+    for s, l in zip(d[kol["situs"]].fillna(""), d[kol["lapis"]].fillna("")):
+        l = str(l).strip().upper().removeprefix("LAPIS").strip()
+        for x in daftar_situs(s):
+            if l in hasil and x not in hasil[l]:
+                hasil[l].append(x)
+    return hasil
+
+
+DAFTAR_SITUS = muat_daftar_situs()
+if not SITUS_TUJUAN:
+    SITUS_TUJUAN = DAFTAR_SITUS["1"]
+if not SITUS_PEMANTAUAN:
+    SITUS_PEMANTAUAN = DAFTAR_SITUS["2"]
+# Lapis X hanya disaring dari hasil (tidak ditulis sebagai -site: di kueri, supaya kueri tetap pendek)
+SITUS_DISARING = DAFTAR_SITUS["X"]
+
+
+def situs_dengan_pemantauan(situs=None, pemantauan=False):
+    """Situs tujuan (bawaan: SITUS_TUJUAN) ditambah situs pemantauan bila diminta."""
+    situs = daftar_situs(SITUS_TUJUAN if situs is None else situs)
+    if pemantauan:
+        situs += [x for x in SITUS_PEMANTAUAN if x not in situs]
+    return situs
+
+
+def _kelompok(situs, ukuran):
+    """Bagi situs ke kelompok yang ukurannya rata (49 situs, maks 8 -> 7 kelompok isi 7)."""
+    ukuran = max(1, int(ukuran or 1))
+    if situs:
+        ukuran = -(-len(situs) // -(-len(situs) // ukuran))
+    for i in range(0, len(situs), ukuran):
+        grup = situs[i:i + ukuran]
+        yield (f"site:{grup[0]}" if len(grup) == 1
+               else "(" + " OR ".join(f"site:{x}" for x in grup) + ")")
+
+
 def susun_kueri(kata_kunci, situs=None, kecualikan=None, hanya_situs=False, sumber_situs=None):
     """Daftar pencarian untuk satu kata kunci: list (kueri, maks_halaman, jenis).
 
     jenis "google" = halaman pencarian Google di Chrome, "rss" = RSS Google News.
     - pencarian umum (semua situs) lewat Chrome, kecuali bila hanya_situs=True
-    - pencarian situs tujuan: lewat RSS satu situs per permintaan (bawaan), atau lewat Chrome
-      dengan SITUS_PER_KUERI situs digabung (bila SUMBER_SITUS = "google")
+    - pencarian situs tujuan: lewat RSS dengan SITUS_PER_RSS situs digabung per permintaan
+      (bawaan), atau lewat Chrome dengan SITUS_PER_KUERI situs digabung (SUMBER_SITUS = "google")
     Situs dikecualikan ditambahkan sebagai -site: pada setiap kueri.
     """
     sumber_situs = sumber_situs or SUMBER_SITUS
@@ -366,11 +435,10 @@ def susun_kueri(kata_kunci, situs=None, kecualikan=None, hanya_situs=False, sumb
         if RSS_UMUM:
             kueri.append((f"{kata_kunci}{minus}", 1, "rss"))
     if sumber_situs == "rss":
-        kueri += [(f"{kata_kunci} site:{x}", 1, "rss") for x in situs]
+        kueri += [(f"{kata_kunci} {g}", 1, "rss") for g in _kelompok(situs, SITUS_PER_RSS)]
     else:
-        for i in range(0, len(situs), SITUS_PER_KUERI):
-            grup = " OR ".join(f"site:{x}" for x in situs[i:i + SITUS_PER_KUERI])
-            kueri.append((f"{kata_kunci} ({grup}){minus}", MAKS_HALAMAN_SITUS, "google"))
+        kueri += [(f"{kata_kunci} {g}{minus}", MAKS_HALAMAN_SITUS, "google")
+                  for g in _kelompok(situs, SITUS_PER_KUERI)]
     return kueri
 
 
@@ -383,7 +451,8 @@ def perkiraan(n_kata_kunci, n_seri=0, n_situs=0, hanya_situs=False, sumber_situs
     g_hal = n_kata_kunci * umum * 4 + (0 if (hanya_situs and n_situs) else n_seri_q * 2)
     rss = (n_kata_kunci * umum + (0 if (hanya_situs and n_situs) else n_seri_q)) if RSS_UMUM else 0
     if sumber_situs == "rss":
-        rss += n_kata_kunci * n_situs + (n_seri_q * n_situs if hanya_situs else 0)
+        n_grup = -(-n_situs // max(1, SITUS_PER_RSS)) if n_situs else 0
+        rss += n_kata_kunci * n_grup + (n_seri_q * n_grup if hanya_situs else 0)
     else:
         n_grup = -(-n_situs // SITUS_PER_KUERI) if n_situs else 0
         g_kueri += n_kata_kunci * n_grup
@@ -545,8 +614,9 @@ def jalankan_scraping(dari, sampai, seri="", hanya_seri=False, kata_kunci=None, 
 
     df = pd.DataFrame(semua)
     if len(df):
-        if kecualikan:
-            df = df[~df["_domain"].map(lambda h: cocok_domain(h, kecualikan))]
+        saring = kecualikan + [x for x in SITUS_DISARING if x not in kecualikan]
+        if saring:
+            df = df[~df["_domain"].map(lambda h: cocok_domain(h, saring))]
         if hanya_situs and situs:
             df = df[df["_domain"].map(lambda h: cocok_domain(h, situs))]
     if len(df):
@@ -950,6 +1020,8 @@ def main():
                     help="Satu atau beberapa kode seri, misalnya: --seri SR025 ST015")
     ap.add_argument("--situs", nargs="+", default=None,
                     help="Situs tujuan tambahan, misalnya: --situs kontan.co.id bisnis.com")
+    ap.add_argument("--pemantauan", action="store_true",
+                    help="Sertakan situs pemantauan (Lapis 2 di daftar_situs.csv)")
     ap.add_argument("--situs-via-google", action="store_true",
                     help="Cari situs tujuan lewat halaman Google (bukan RSS); lebih mudah diblokir")
     ap.add_argument("--hanya-situs", action="store_true",
@@ -974,7 +1046,8 @@ def main():
 
     df = jalankan_scraping(dari, sampai, a.seri, a.hanya_seri,
                            gabung_judul_sama=a.gabung_judul_sama or None,
-                           situs=a.situs, kecualikan=a.kecualikan, hanya_situs=a.hanya_situs,
+                           situs=situs_dengan_pemantauan(a.situs, a.pemantauan),
+                           kecualikan=a.kecualikan, hanya_situs=a.hanya_situs,
                            sumber_situs="google" if a.situs_via_google else None)
     for p in df.attrs.get("peringatan", []):
         print("PERINGATAN:", p)
