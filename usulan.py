@@ -12,8 +12,8 @@ Alur:
 Sheet usulan sengaja dipisah dari Sheet data: akun pembaca (dipakai dashboard online)
 hanya boleh MENULIS di Sheet usulan dan tetap hanya bisa MEMBACA Sheet data.
 
-Pengaturan di komputer admin: isi ID_SHEET_USULAN di bawah. Kunci penulis (kunci_google.json)
-harus punya akses Editor ke Sheet usulan.
+Pengaturan di komputer admin: isi id_sheet_usulan di pengaturan_online.ini (lihat
+sinkron_sheets.py). Kunci penulis (kunci_google.json) harus punya akses Editor ke Sheet usulan.
 """
 
 import json
@@ -26,8 +26,8 @@ import pandas as pd
 import scraper_sbsn_chrome as sc
 import sinkron_sheets as sk
 
-# ID atau URL lengkap Google Sheet usulan (BUKAN Sheet data berita)
-ID_SHEET_USULAN = "https://docs.google.com/spreadsheets/d/1X_B1QndkCk7QCFD5RrR1Df6XT7RTxERPxauLn-M6TH4/edit?usp=sharing"
+# Cadangan untuk versi lama; isi id_sheet_usulan di pengaturan_online.ini (tidak tertimpa saat update)
+ID_SHEET_USULAN = ""
 
 TAB_USULAN = "Usulan"
 KOLOM_USULAN = ["ID", "Diajukan", "Pengusul", "Jenis", "Judul saat ini", "Link", "Ringkasan usulan",
@@ -40,7 +40,8 @@ BATAS = {"nama": 60, "teks": 300, "alasan": 500}
 
 
 def id_sheet_usulan():
-    return os.environ.get("SBSN_ID_SHEET_USULAN") or ID_SHEET_USULAN
+    return (os.environ.get("SBSN_ID_SHEET_USULAN") or sk.baca_pengaturan("id_sheet_usulan")
+            or ID_SHEET_USULAN)
 
 
 def aktif():

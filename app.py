@@ -351,9 +351,13 @@ def sinkron_online(ubah=(), hapus=()):
         return
     try:
         import sinkron_sheets as sk
-        if not sk.aktif():
-            return
-    except Exception:   # gspread belum terpasang: dashboard online tidak dipakai
+        aktif, alasan = sk.status_online()
+    except Exception as e:   # gspread belum terpasang / berkas sinkron_sheets.py versi lama
+        aktif, alasan = False, f"modul sinkron_sheets tidak dapat dipakai ({e})"
+    if not aktif:
+        if alasan:   # dashboard online dipakai tetapi pengaturannya belum lengkap
+            ss["pesan_sinkron"] = (False, "Perubahan hanya tersimpan di komputer; Google Sheet tidak "
+                                          f"ikut berubah. {alasan}")
         return
     with st.spinner("Meneruskan perubahan ke dashboard online…"):
         ss["pesan_sinkron"] = sk.catat_perubahan(ubah, hapus)
@@ -1305,8 +1309,8 @@ def halaman_usulan():
     import usulan as us
     sec("Usulan perubahan dari dashboard online")
     if not _usulan_aktif():
-        st.info("Fitur usulan belum diatur di komputer ini. Isi **ID_SHEET_USULAN** di `usulan.py` "
-                "dan pastikan `kunci_google.json` ada (lihat PANDUAN_DEPLOY.md, bagian Usulan).")
+        st.info("Fitur usulan belum diatur di komputer ini. Isi **id_sheet_usulan** di "
+                "`pengaturan_online.ini` dan pastikan `kunci_google.json` ada (lihat PANDUAN_DEPLOY.md).")
         return
     st.caption("Usulan dari pengguna dashboard **tidak mengubah data** sampai Anda menyetujuinya. "
                "Usulan yang disetujui diterapkan ke file lokal, lalu otomatis ke dashboard online.")
@@ -1428,9 +1432,12 @@ with st.sidebar:
 
     try:
         import sinkron_sheets as _sk
-        _online = _sk.aktif()
-    except Exception:   # gspread belum terpasang
-        _online = False
+        _online, _alasan = _sk.status_online()
+    except Exception as _e:   # gspread belum terpasang / berkas versi lama
+        _online, _alasan = False, f"modul sinkron_sheets tidak dapat dipakai ({_e})"
+    if not _online and _alasan:
+        st.markdown("### Dashboard online")
+        st.error(f"⚠️ Tidak tersinkron ke Google Sheet: {_alasan}")
     if _usulan_aktif():
         try:
             _u = muat_usulan()
@@ -1453,3 +1460,21 @@ with st.sidebar:
         else:
             st.caption("☁️ Koreksi dan penghapusan berita otomatis diteruskan ke Google Sheet "
                        "dashboard online.")
+        with st.expander("🔁 Samakan Google Sheet dengan data lokal"):
+            st.caption("Menyusulkan koreksi dan penghapusan (termasuk usulan yang sudah disetujui) "
+                       "yang belum sampai ke Google Sheet. Data lokal menjadi acuan; koreksi yang "
+                       "dibuat langsung di Sheet ikut tertimpa.")
+            if st.button("Samakan sekarang", key="samakan_sheet"):
+                with st.spinner("Membandingkan dan memperbarui Google Sheet…"):
+                    try:
+                        _hapus = []
+                        if _usulan_aktif():
+                            _u = muat_usulan()
+                            _hapus = list(_u.loc[(_u["Status"] == "Disetujui")
+                                                 & _u["_data"].map(lambda d: d["hapus"]), "Link"])
+                        _n_u, _n_h = _sk.samakan(gabung(daftar_file()), _hapus, log=lambda *_: None)
+                        ss["pesan_sinkron"] = (True, f"Google Sheet disamakan: {_n_u} berita dikoreksi, "
+                                                     f"{_n_h} berita dihapus.")
+                    except Exception as _e:
+                        ss["pesan_sinkron"] = (False, f"Gagal menyamakan Google Sheet: {_e}")
+                st.rerun()

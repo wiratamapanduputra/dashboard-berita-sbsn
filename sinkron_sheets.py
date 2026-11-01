@@ -8,14 +8,23 @@ Isi Google Sheet (dibuat otomatis saat unggah pertama):
 
 Koreksi data (tone, topik, seri) bisa langsung di tab "Berita". Untuk menghapus berita,
 potong (cut) barisnya dari tab "Berita" lalu tempel ke tab "Dihapus".
+Koreksi dan penghapusan lewat aplikasi admin (app.py) diteruskan otomatis ke Sheet; bila
+sedang gagal (misalnya tidak ada internet), perubahan disimpan di antrean_sinkron.json dan
+dikirim ulang oleh jadwal scraping atau unggah berikutnya.
 
 Cara pakai dari terminal (venv aktif):
     python sinkron_sheets.py --cek                 # uji koneksi ke Google Sheet
     python sinkron_sheets.py --semua               # unggah semua file di folder hasil
     python sinkron_sheets.py hasil/berita_sbsn_2026-10.xlsx   # unggah file tertentu
 
-Pengaturan: isi ID_SHEET di bawah dan taruh file kunci service account (JSON)
-di folder ini dengan nama kunci_google.json.
+Pengaturan (sekali saja, TIDAK tertimpa saat berkas program diperbarui):
+  - pengaturan_online.ini di folder ini, berisi:
+        [google_sheet]
+        id_sheet = https://docs.google.com/spreadsheets/d/xxxx/edit
+        id_sheet_usulan = https://docs.google.com/spreadsheets/d/yyyy/edit
+  - kunci_google.json (kunci service account penulis) di folder ini.
+
+    python sinkron_sheets.py --samakan   # samakan Sheet dengan data lokal (data lokal = sumber utama)
 """
 
 import argparse
@@ -35,11 +44,14 @@ import scraper_sbsn_chrome as sc
 # ---------------------------------------------------------------------------
 
 FOLDER = Path(__file__).resolve().parent
-# ID atau URL lengkap Google Sheet, misalnya
-# "https://docs.google.com/spreadsheets/d/1AbC...xyz/edit"  atau cukup "1AbC...xyz"
-ID_SHEET = "https://docs.google.com/spreadsheets/d/1djyewT1kP8yJ0gvzrAJcprSpqQIYoSyFS2v-Sj0b7Zk/edit?usp=sharing"
+# Isi ID/URL Sheet di pengaturan_online.ini (disarankan). ID_SHEET di bawah hanya cadangan
+# untuk versi lama; nilainya ikut hilang bila berkas ini ditimpa versi baru.
+ID_SHEET = ""
+FILE_PENGATURAN = FOLDER / "pengaturan_online.ini"
 # Kunci service account PENULIS (akses Editor ke Sheet). Jangan dibagikan / diunggah ke GitHub.
 FILE_KUNCI = FOLDER / "kunci_google.json"
+# Antrean koreksi/penghapusan dari aplikasi admin yang belum terkirim ke Sheet
+FILE_ANTREAN = FOLDER / "antrean_sinkron.json"
 
 TAB_BERITA, TAB_DIHAPUS, TAB_INFO = "Berita", "Dihapus", "Info"
 KOLOM_SHEET = ["Tanggal", "Situs", "Judul", "Link", "Topik", "Tone", "Ritel", "Diunggah"]
@@ -74,13 +86,45 @@ def email_service_account(info=None):
         return ""
 
 
+def baca_pengaturan(kunci):
+    """Nilai dari pengaturan_online.ini, bagian [google_sheet]. Kosong bila tidak ada."""
+    import configparser
+    cp = configparser.RawConfigParser()
+    try:
+        cp.read(FILE_PENGATURAN, encoding="utf-8-sig")
+        return cp.get("google_sheet", kunci, fallback="").strip().strip('"').strip("'")
+    except Exception:
+        return ""
+
+
+def id_sheet_data():
+    return os.environ.get("SBSN_ID_SHEET") or baca_pengaturan("id_sheet") or ID_SHEET
+
+
+def status_online():
+    """(aktif, alasan). alasan kosong bila dashboard online memang tidak dipakai di komputer ini."""
+    ada_id, ada_kunci = bool(id_sheet_data()), FILE_KUNCI.exists()
+    if ada_id and ada_kunci:
+        return True, ""
+    if not ada_id and not ada_kunci:
+        return False, ""
+    if not ada_id:
+        return False, f"ID Sheet data belum diisi di {FILE_PENGATURAN.name} (baris id_sheet)."
+    return False, f"File kunci {FILE_KUNCI.name} tidak ditemukan di folder scraper."
+
+
+def aktif():
+    """True bila dashboard online sudah diatur di komputer ini (ID Sheet dan kunci penulis ada)."""
+    return status_online()[0]
+
+
 def buka(id_sheet=None, info=None, baca_saja=False):
     """Buka Google Sheet. info = isi kunci service account (dict); kosong = pakai FILE_KUNCI."""
     import gspread
 
-    id_sheet = id_dari_url(id_sheet or os.environ.get("SBSN_ID_SHEET") or ID_SHEET)
+    id_sheet = id_dari_url(id_sheet or id_sheet_data())
     if not id_sheet:
-        raise ValueError("ID Google Sheet belum diisi. Isi ID_SHEET di sinkron_sheets.py.")
+        raise ValueError(f"ID Google Sheet belum diisi. Isi id_sheet di {FILE_PENGATURAN.name}.")
     scopes = SCOPE_BACA if baca_saja else SCOPE_TULIS
     if info:
         gc = gspread.service_account_from_dict(dict(info), scopes=scopes)
@@ -229,6 +273,148 @@ def unggah(df, sh=None, log=print):
 
 
 # ---------------------------------------------------------------------------
+# KOREKSI & PENGHAPUSAN DARI APLIKASI ADMIN
+# ---------------------------------------------------------------------------
+
+def _baca_antrean():
+    try:
+        return json.loads(FILE_ANTREAN.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _simpan_antrean(items):
+    if items:
+        FILE_ANTREAN.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    else:
+        FILE_ANTREAN.unlink(missing_ok=True)
+
+
+def jumlah_antrean():
+    return len(_baca_antrean())
+
+
+def catat_perubahan(ubah=(), hapus=()):
+    """Masukkan koreksi (list dict berkolom Link, Judul, Situs, Tanggal, Topik, Tone, Ritel) dan
+    penghapusan (list dict berkolom Link, Judul) ke antrean, lalu langsung coba kirim.
+    Mengembalikan (berhasil, pesan)."""
+    items = _baca_antrean()
+    waktu = sekarang_wib()
+    for r in ubah:
+        baris = ke_baris(r, waktu)
+        items.append({"aksi": "ubah", "waktu": waktu,
+                      "data": dict(zip(KOLOM_SHEET[:7], baris[:7]))})
+    for h in hapus:
+        items.append({"aksi": "hapus", "waktu": waktu, "link": _teks(h.get("Link")),
+                      "judul": _teks(h.get("Judul"))})
+    _simpan_antrean(items)
+    return kirim_antrean_aman()
+
+
+def kirim_antrean_aman(log=lambda *_: None):
+    """Seperti kirim_antrean, tetapi tidak melempar error. Mengembalikan (berhasil, pesan)."""
+    try:
+        n = kirim_antrean(log=log)
+        return True, f"{n} perubahan diteruskan ke dashboard online."
+    except Exception as e:
+        return False, (f"Perubahan tersimpan di komputer, tetapi belum terkirim ke dashboard online "
+                       f"({e}). Akan dicoba lagi otomatis pada jadwal berikutnya.")
+
+
+def kirim_antrean(sh=None, log=print):
+    """Terapkan antrean ke Sheet: koreksi memperbarui baris di tab Berita; penghapusan dicatat di
+    tab Dihapus dan barisnya dibuang dari tab Berita. Mengembalikan jumlah perubahan terkirim."""
+    items = _baca_antrean()
+    if not items:
+        return 0
+    sh = sh or buka()
+    ws = _tab(sh, TAB_BERITA, KOLOM_SHEET)
+    wsd = _tab(sh, TAB_DIHAPUS, KOLOM_DIHAPUS)
+    nilai = ws.get_all_values()
+    header = [str(h).strip() for h in (nilai[0] if nilai else KOLOM_SHEET)]
+    if header[:7] != KOLOM_SHEET[:7]:
+        raise ValueError("Urutan kolom tab Berita berubah. Kembalikan judul kolom baris pertama "
+                         f"menjadi: {', '.join(KOLOM_SHEET)}")
+    baris_ke = {}   # kunci link -> nomor baris di Sheet (mulai 2)
+    for i, r in enumerate(nilai[1:], start=2):
+        if len(r) > 3 and str(r[3]).strip():
+            baris_ke.setdefault(sc.kunci_link(r[3]), []).append(i)
+
+    # Perubahan terakhir per berita yang berlaku; penghapusan mengalahkan koreksi
+    ubah, hapus = {}, {}
+    for it in items:
+        if it.get("aksi") == "hapus":
+            k = sc.kunci_link(it.get("link", ""))
+            hapus[k] = it
+            ubah.pop(k, None)
+        elif it.get("aksi") == "ubah":
+            k = sc.kunci_link(it["data"].get("Link", ""))
+            if k not in hapus:
+                ubah[k] = it["data"]
+
+    pembaruan = []
+    for k, d in ubah.items():
+        for row in baris_ke.get(k, []):
+            isi = [d.get(c, "") for c in KOLOM_SHEET[:7]]
+            isi[3] = nilai[row - 1][3]   # link di Sheet tidak diubah
+            pembaruan.append({"range": f"A{row}:G{row}", "values": [isi]})
+    if pembaruan:
+        ws.batch_update(pembaruan, value_input_option="RAW")
+
+    tercatat = set()
+    dh = baca_tab(wsd)
+    if "Link" in dh:
+        tercatat = set(dh["Link"].map(sc.kunci_link))
+    catat = [[h["link"], h.get("judul", ""), f"Dihapus lewat aplikasi admin, {h.get('waktu', '')}"]
+             for k, h in hapus.items() if k not in tercatat and h.get("link")]
+    if catat:
+        wsd.append_rows(catat, value_input_option="RAW")
+    buang = sorted({row for k in hapus for row in baris_ke.get(k, [])}, reverse=True)
+    if buang:   # dari bawah ke atas supaya nomor baris tidak bergeser
+        sh.batch_update({"requests": [
+            {"deleteDimension": {"range": {"sheetId": ws.id, "dimension": "ROWS",
+                                           "startIndex": r - 1, "endIndex": r}}} for r in buang]})
+    perbarui_info(sh, max(len(nilai) - 1 - len(buang), 0))
+    _simpan_antrean(_baca_antrean()[len(items):])   # sisakan yang masuk saat pengiriman berjalan
+    log(f"Google Sheet: {len(pembaruan)} baris dikoreksi, {len(hapus)} berita dihapus "
+        "(dari aplikasi admin).")
+    return len(items)
+
+
+def samakan(df_lokal, hapus_links=(), sh=None, log=print):
+    """Jadikan baris di tab Berita sama dengan data lokal (sumber utama) untuk berita yang ada
+    di keduanya, dan hapus dari Sheet berita di hapus_links. Berguna untuk menyusulkan koreksi
+    yang dulu tidak terkirim. Koreksi yang dibuat LANGSUNG di Sheet ikut tertimpa.
+    Mengembalikan (jumlah koreksi, jumlah penghapusan)."""
+    sh = sh or buka()
+    ws = _tab(sh, TAB_BERITA, KOLOM_SHEET)
+    nilai = ws.get_all_values()
+    di_sheet = {}
+    for r in nilai[1:]:
+        if len(r) > 3 and str(r[3]).strip():
+            di_sheet.setdefault(sc.kunci_link(r[3]), list(r) + [""] * 8)
+    waktu = sekarang_wib()
+    items, sudah, n_ubah, n_hapus = _baca_antrean(), set(), 0, 0
+    for r in df_lokal.to_dict("records"):
+        k = sc.kunci_link(_teks(r.get("Link")))
+        if k in sudah or k not in di_sheet:
+            continue
+        sudah.add(k)
+        baru = ke_baris(r, waktu)[:7]
+        lama = [str(x).strip() for x in di_sheet[k][:7]]
+        if any(baru[i] != lama[i] for i in (0, 1, 2, 4, 5, 6)):
+            items.append({"aksi": "ubah", "waktu": waktu, "data": dict(zip(KOLOM_SHEET[:7], baru))})
+            n_ubah += 1
+    for link in hapus_links:
+        if sc.kunci_link(link) in di_sheet:
+            items.append({"aksi": "hapus", "waktu": waktu, "link": _teks(link), "judul": ""})
+            n_hapus += 1
+    _simpan_antrean(items)
+    kirim_antrean(sh, log=log)
+    return n_ubah, n_hapus
+
+
+# ---------------------------------------------------------------------------
 # BACA (dipakai dashboard online)
 # ---------------------------------------------------------------------------
 
@@ -293,6 +479,8 @@ def main():
     ap.add_argument("file", nargs="*", help="File Excel hasil yang diunggah")
     ap.add_argument("--semua", action="store_true", help="Unggah semua file di folder hasil")
     ap.add_argument("--cek", action="store_true", help="Hanya uji koneksi ke Google Sheet")
+    ap.add_argument("--samakan", action="store_true",
+                    help="Samakan isi Sheet dengan data lokal (menyusulkan koreksi yang belum terkirim)")
     a = ap.parse_args()
 
     try:
@@ -305,13 +493,32 @@ def main():
         df, info = baca_untuk_dashboard(sh)
         print(f"Isi saat ini: {len(df)} berita. Terakhir diperbarui: "
               f"{info.get('Terakhir diperbarui', '-')}")
+        print(f"Antrean perubahan dari aplikasi admin yang belum terkirim: {jumlah_antrean()}")
         return
 
+    try:
+        kirim_antrean(sh)
+    except Exception as e:
+        print(f"PERINGATAN: antrean koreksi/penghapusan belum terkirim: {e}")
+    if a.samakan:
+        lokal = baca_excel_hasil(sorted(sc.FOLDER_HASIL.glob("berita_sbsn_*.xlsx")))
+        hapus = []
+        try:
+            import usulan
+            if usulan.aktif():
+                u = usulan.daftar_usulan(usulan.buka())
+                hapus = list(u.loc[(u["Status"] == usulan.DISETUJUI)
+                                   & u["_data"].map(lambda d: d["hapus"]), "Link"])
+        except Exception as e:
+            print(f"PERINGATAN: daftar usulan hapus tidak terbaca: {e}")
+        n_u, n_h = samakan(lokal, hapus, sh)
+        print(f"Selesai: {n_u} berita dikoreksi, {n_h} berita dihapus di Google Sheet.")
+        return
     files = [Path(f) for f in a.file]
     if a.semua:
         files += sorted(sc.FOLDER_HASIL.glob("berita_sbsn_*.xlsx"))
     if not files:
-        ap.error("Sebutkan file yang diunggah, atau pakai --semua.")
+        ap.error("Sebutkan file yang diunggah, atau pakai --semua / --samakan.")
     print(f"Membaca {len(files)} file…")
     try:
         unggah(baca_excel_hasil(files), sh)
