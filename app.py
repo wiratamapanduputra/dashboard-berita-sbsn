@@ -7,7 +7,11 @@ atau klik dua kali jalankan_platform.bat
 Logo resmi (opsional): taruh file berikut di subfolder "assets":
     assets/logo_kemenkeu.png   dan   assets/logo_djppr.png
 
-Menu: 1. Ambil berita  2. Dashboard  3. Ringkasan pimpinan  4. Tinjau & kelola
+Menu: 1. Ambil berita  2. Dashboard  3. Ringkasan pimpinan  4. Tinjau & kelola  5. Usulan
+
+Bila dashboard online (Google Sheet) sudah diatur di sinkron_sheets.py, setiap koreksi dan
+penghapusan berita di aplikasi ini otomatis diteruskan ke Google Sheet. Usulan perubahan dari
+dashboard online ditinjau di menu 📥 Usulan; data baru berubah setelah usulan disetujui.
 """
 
 import base64
@@ -32,7 +36,7 @@ ss = st.session_state
 # NAVIGASI & PENYIMPANAN PILIHAN
 # ---------------------------------------------------------------------------
 
-MENU = ["🔎 Ambil berita", "📊 Dashboard", "📋 Ringkasan pimpinan", "✏️ Tinjau & kelola"]
+MENU = ["🔎 Ambil berita", "📊 Dashboard", "📋 Ringkasan pimpinan", "✏️ Tinjau & kelola", "📥 Usulan"]
 SUB_DASH = ["Ikhtisar", "Daftar berita", "Situs media"]
 FILTER_KEYS = ["f_tone", "f_topik", "f_situs", "f_seri", "f_cari", "f_tgl"]
 
@@ -302,18 +306,22 @@ def gabung(files):
 
 
 def terapkan_perubahan(edit=None, hapus=()):
-    """Simpan koreksi/penghapusan ke SEMUA file hasil yang memuat link tersebut."""
+    """Simpan koreksi/penghapusan ke SEMUA file hasil yang memuat link tersebut,
+    lalu teruskan ke Google Sheet dashboard online (bila sudah diatur)."""
     ubah = {}
     if edit is not None and len(edit):
         for r in edit.to_dict("records"):
             ubah[sc.kunci_link(r["Link"])] = r
     hapus_k = {sc.kunci_link(x) for x in hapus}
+    judul_hapus = {}
     n_file = 0
     for path in daftar_file():
         df = baca_excel(path)
         k = df["Link"].map(sc.kunci_link)
         berubah = False
         if hapus_k and k.isin(hapus_k).any():
+            for kk, jd in zip(k[k.isin(hapus_k)], df.loc[k.isin(hapus_k), "Judul"]):
+                judul_hapus.setdefault(kk, jd)
             df, k = df[~k.isin(hapus_k)], k[~k.isin(hapus_k)]
             berubah = True
         for i, kk in k.items():
@@ -329,7 +337,26 @@ def terapkan_perubahan(edit=None, hapus=()):
             df = df.sort_values("Tanggal", ascending=True, na_position="last", kind="stable").reset_index(drop=True)
             path.write_bytes(sc.excel_bytes(df))
             n_file += 1
+    sinkron_online(list(ubah.values()),
+                   [{"Link": x, "Judul": judul_hapus.get(sc.kunci_link(x), "")} for x in hapus])
     return n_file
+
+
+def sinkron_online(ubah=(), hapus=()):
+    """Teruskan koreksi dan penghapusan ke Google Sheet dashboard online.
+    Tidak melakukan apa pun bila dashboard online belum diatur (ID_SHEET / kunci belum ada).
+    Bila gagal (misalnya tidak ada internet), perubahan disimpan di antrean dan dikirim ulang
+    otomatis oleh jadwal scraping berikutnya."""
+    if not (ubah or hapus):
+        return
+    try:
+        import sinkron_sheets as sk
+        if not sk.aktif():
+            return
+    except Exception:   # gspread belum terpasang: dashboard online tidak dipakai
+        return
+    with st.spinner("Meneruskan perubahan ke dashboard online…"):
+        ss["pesan_sinkron"] = sk.catat_perubahan(ubah, hapus)
 
 
 def daftar_seri_df(df):
@@ -1237,6 +1264,131 @@ def halaman_kelola():
 
 
 # ===========================================================================
+# HALAMAN 5: USULAN DARI DASHBOARD ONLINE
+# ===========================================================================
+
+def _usulan_aktif():
+    try:
+        import usulan as us
+        return us.aktif()
+    except Exception:   # gspread belum terpasang
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner="Memuat usulan…")
+def muat_usulan():
+    import usulan as us
+    return us.daftar_usulan(us.buka())
+
+
+def _nilai_tampil(kolom, v):
+    if kolom == "Tanggal":
+        t = pd.to_datetime(v, errors="coerce")
+        return t.strftime("%d/%m/%Y") if pd.notna(t) else "–"
+    return str(v) if str(v).strip() else "–"
+
+
+def setujui_usulan(u, lokal):
+    """Terapkan usulan ke data lokal (lalu otomatis ke Google Sheet data)."""
+    d = u["_data"]
+    if d["hapus"]:
+        terapkan_perubahan(hapus=[u["Link"]])
+        return
+    baris = {k: lokal[k] for k in ["Link", "Judul", "Situs", "Tanggal", "Topik", "Tone", "Ritel"]}
+    for kol, (_, baru) in d["perubahan"].items():
+        baris[kol] = pd.to_datetime(baru, errors="coerce") if kol == "Tanggal" else baru
+    baris["Ritel"] = ", ".join(sc.daftar_seri(baris["Ritel"]))
+    terapkan_perubahan(pd.DataFrame([baris]))
+
+
+def halaman_usulan():
+    import usulan as us
+    sec("Usulan perubahan dari dashboard online")
+    if not _usulan_aktif():
+        st.info("Fitur usulan belum diatur di komputer ini. Isi **ID_SHEET_USULAN** di `usulan.py` "
+                "dan pastikan `kunci_google.json` ada (lihat PANDUAN_DEPLOY.md, bagian Usulan).")
+        return
+    st.caption("Usulan dari pengguna dashboard **tidak mengubah data** sampai Anda menyetujuinya. "
+               "Usulan yang disetujui diterapkan ke file lokal, lalu otomatis ke dashboard online.")
+    c1, c2, c3 = st.columns([2, 1.4, 1], vertical_alignment="bottom")
+    ss.setdefault("us_status", us.MENUNGGU)
+    status = c1.segmented_control("Status", [us.MENUNGGU, us.DISETUJUI, us.DITOLAK, "Semua"],
+                                  key="us_status") or us.MENUNGGU
+    ss.setdefault("nama_admin", "Admin")
+    oleh = c2.text_input("Nama admin (tercatat di keputusan)", key="nama_admin")
+    if c3.button("🔄 Muat ulang"):
+        muat_usulan.clear()
+        st.rerun()
+    try:
+        semua_u = muat_usulan()
+    except Exception as e:
+        st.error(f"Usulan tidak dapat dimuat: {e}")
+        return
+    tampil = semua_u if status == "Semua" else semua_u[semua_u["Status"] == status]
+    if tampil.empty:
+        st.success("Tidak ada usulan yang menunggu." if status == us.MENUNGGU else "Tidak ada usulan.")
+        return
+    lokal = gabung(daftar_file())
+    lokal = {sc.kunci_link(r["Link"]): r for r in lokal.to_dict("records")}
+    st.markdown(f"**{len(tampil)} usulan**")
+
+    for _, u in tampil.iterrows():
+        d = u["_data"]
+        r = lokal.get(sc.kunci_link(u["Link"]))
+        with st.container(border=True):
+            ikon = "🗑️" if d["hapus"] else "✏️"
+            st.markdown(f"{ikon} **{html.escape(u['Jenis'])}** · diusulkan **{html.escape(u['Pengusul'])}** "
+                        f"· {html.escape(u['Diajukan'])} · `{u['ID']}`")
+            st.markdown(f"[{html.escape(u['Judul saat ini'] or u['Link'])}]({u['Link']})")
+            if r is None:
+                st.warning("Berita ini tidak ditemukan di data lokal (mungkin sudah dihapus).")
+            if d["hapus"]:
+                st.markdown("**Usulan:** hapus berita ini.")
+            else:
+                tabel, berubah_sejak = [], []
+                for kol, (lama, baru) in d["perubahan"].items():
+                    kini = us.nilai_baku(kol, r[kol]) if r is not None else ""
+                    if r is not None and kini != lama:
+                        berubah_sejak.append(us.LABEL.get(kol, kol))
+                    tabel.append({"Kolom": us.LABEL.get(kol, kol),
+                                  "Data lokal sekarang": _nilai_tampil(kol, kini) if r is not None else "–",
+                                  "Saat diusulkan": _nilai_tampil(kol, lama),
+                                  "Usulan": _nilai_tampil(kol, baru)})
+                st.dataframe(pd.DataFrame(tabel), hide_index=True, width="stretch")
+                if berubah_sejak:
+                    st.warning("Data lokal sudah berubah sejak usulan dibuat pada kolom: "
+                               + ", ".join(berubah_sejak) + ". Periksa sebelum menyetujui.")
+            if u["Alasan"]:
+                st.markdown(f"**Alasan pengusul:** {html.escape(u['Alasan'])}")
+
+            if u["Status"] != us.MENUNGGU:
+                st.caption(f"**{u['Status']}** oleh {u['Oleh'] or '-'} · {u['Diputuskan'] or '-'}"
+                           + (f" · Catatan: {u['Catatan admin']}" if u["Catatan admin"] else ""))
+                continue
+            catatan = st.text_input("Catatan admin (opsional)", key=f"cat_{u['ID']}")
+            b1, b2, _ = st.columns([1, 1, 3])
+            bisa = d["hapus"] or r is not None
+            if b1.button("✅ Setujui", key=f"ok_{u['ID']}", type="primary", disabled=not bisa,
+                         help=None if bisa else "Berita tidak ada di data lokal; hanya bisa ditolak."):
+                try:
+                    setujui_usulan(u, r)
+                    us.putuskan(us.buka(), u["ID"], us.DISETUJUI, oleh, catatan)
+                    ss["toast"] = f"Usulan {u['ID']} disetujui dan diterapkan."
+                except Exception as e:
+                    ss["toast"] = f"Usulan diterapkan ke data lokal, tetapi status gagal dicatat: {e}"
+                muat_usulan.clear()
+                st.rerun()
+            if b2.button("❌ Tolak", key=f"tolak_{u['ID']}"):
+                try:
+                    us.putuskan(us.buka(), u["ID"], us.DITOLAK, oleh, catatan)
+                    ss["toast"] = f"Usulan {u['ID']} ditolak."
+                except Exception as e:
+                    ss["toast"] = f"Status gagal dicatat: {e}"
+                muat_usulan.clear()
+                st.rerun()
+
+
+# ===========================================================================
 # SUSUNAN HALAMAN
 # ===========================================================================
 
@@ -1244,6 +1396,9 @@ hero()
 st.radio("Menu", MENU, key="menu", horizontal=True, label_visibility="collapsed")
 if "toast" in ss:
     st.toast(ss.pop("toast"), icon="✅")
+if "pesan_sinkron" in ss:
+    _ok, _pesan = ss.pop("pesan_sinkron")
+    st.toast(_pesan, icon="☁️" if _ok else "⚠️")
 
 halaman = ss["menu"]
 if halaman == MENU[0]:
@@ -1252,6 +1407,8 @@ elif halaman == MENU[1]:
     halaman_dashboard()
 elif halaman == MENU[2]:
     halaman_pimpinan()
+elif halaman == MENU[4]:
+    halaman_usulan()
 else:
     halaman_kelola()
 
@@ -1268,3 +1425,31 @@ with st.sidebar:
     st.caption("Saat ini: " + ("link sama **atau** judul+situs sama dianggap duplikat."
                                if ss.get("gabung_judul_sama") else
                                "hanya **link sama** yang dianggap duplikat."))
+
+    try:
+        import sinkron_sheets as _sk
+        _online = _sk.aktif()
+    except Exception:   # gspread belum terpasang
+        _online = False
+    if _usulan_aktif():
+        try:
+            _u = muat_usulan()
+            _n_u = int((_u["Status"] == "Menunggu").sum())
+        except Exception:
+            _n_u = 0
+        if _n_u:
+            st.markdown("### Usulan")
+            st.info(f"📥 {_n_u} usulan dari dashboard menunggu persetujuan.")
+            st.button("Tinjau usulan", on_click=pergi, kwargs={"menu": MENU[4]}, key="ke_usulan")
+    if _online:
+        st.markdown("### Dashboard online")
+        _n_antre = _sk.jumlah_antrean()
+        if _n_antre:
+            st.warning(f"{_n_antre} perubahan belum terkirim ke dashboard online.")
+            if st.button("☁️ Kirim sekarang", key="kirim_antrean"):
+                with st.spinner("Mengirim…"):
+                    ss["pesan_sinkron"] = _sk.kirim_antrean_aman()
+                st.rerun()
+        else:
+            st.caption("☁️ Koreksi dan penghapusan berita otomatis diteruskan ke Google Sheet "
+                       "dashboard online.")

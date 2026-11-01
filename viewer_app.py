@@ -4,7 +4,9 @@ Memakai ulang tampilan app.py (tema, grafik, Dashboard, Ringkasan pimpinan, lapo
 tanpa mengubah app.py, tetapi:
   - data dibaca dari Google Sheet (bukan folder hasil),
   - menu Ambil berita dan Tinjau & kelola tidak ditampilkan,
-  - berita tidak bisa diedit atau dihapus dari dashboard.
+  - berita tidak bisa diedit atau dihapus langsung dari dashboard. Bila Sheet usulan diatur,
+    pengguna bisa MENGUSULKAN perubahan (✏️ pada kartu berita, wajib mengisi nama). Usulan baru
+    berlaku setelah disetujui admin di aplikasi admin (menu 📥 Usulan).
 
 Jalankan:
   - Online  : file utama (main file) di Streamlit Community Cloud = viewer_app.py
@@ -14,12 +16,15 @@ Jalankan:
 Isi secrets (Streamlit Cloud > App settings > Secrets, atau .streamlit/secrets.toml):
     id_sheet = "https://docs.google.com/spreadsheets/d/xxxx/edit"
     # kata_sandi = "opsional, bila aplikasi dibuat publik"
+    # id_sheet_usulan = "https://docs.google.com/spreadsheets/d/yyyy/edit"   # aktifkan fitur usulan
+    # kode_usulan = "opsional: kode yang wajib diisi saat mengirim usulan"
     [gcp_service_account]
     type = "service_account"
     ... (salin seluruh isi kunci JSON service account PEMBACA)
 """
 
 import hmac
+import html
 from datetime import date
 from pathlib import Path
 
@@ -29,10 +34,12 @@ FOLDER = Path(__file__).resolve().parent
 FILE_APP = FOLDER / "app.py"
 PENANDA = "# SUSUNAN HALAMAN"
 MENIT_SEGAR = 10
+MAKS_USULAN_PER_SESI = 20
 
 # Teks di app.py yang tidak berlaku pada versi baca-saja (dilewati bila tidak ditemukan)
 GANTI = [
-    ('st.caption("Klik ✏️ di samping kartu untuk mengedit atau menghapus berita.")', "pass"),
+    ('st.caption("Klik ✏️ di samping kartu untuk mengedit atau menghapus berita.")',
+     "st.caption(TEKS_KARTU) if TEKS_KARTU else None"),
     ('Ambil berita dulu di menu **🔎 Ambil berita** "\n                "atau ganti sumber data.',
      'Silakan ganti sumber data."\n                "'),
 ]
@@ -58,6 +65,7 @@ def _kode_app(mtime):
 G = {"__name__": "app_viewer", "__file__": str(FILE_APP)}
 exec(_kode_app(FILE_APP.stat().st_mtime), G)
 sc, ss = G["sc"], G["ss"]
+G["TEKS_KARTU"] = ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +183,105 @@ def kartu_baca(df, kunci, per_halaman=15, edit=True):
 
 
 # ---------------------------------------------------------------------------
+# USULAN PERUBAHAN (menunggu persetujuan admin)
+# ---------------------------------------------------------------------------
+
+def usulan_aktif():
+    return bool(rahasia("id_sheet_usulan") and rahasia("gcp_service_account"))
+
+
+def _sheet_usulan():
+    import usulan as us
+    return us.buka(str(rahasia("id_sheet_usulan")), info=dict(rahasia("gcp_service_account")))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def menunggu_usulan(_kunci_cache):
+    """Kunci link berita yang sedang punya usulan menunggu persetujuan."""
+    import usulan as us
+    try:
+        return us.link_menunggu(us.daftar_usulan(_sheet_usulan()))
+    except Exception:
+        return set()
+
+
+@st.dialog("✏️ Usulkan perubahan berita", width="large")
+def dialog_usulan(r):
+    import usulan as us
+    TONE = G["TONE"]
+    st.caption("Usulan **tidak langsung mengubah data**. Data berubah setelah disetujui admin.")
+    st.markdown(f"**{html.escape(r['Judul'])}**  \n{html.escape(r['Situs'] or '—')} · "
+                f"[buka berita]({r['Link']})")
+    c1, c2 = st.columns(2)
+    nama = c1.text_input("Nama pengusul *", value=ss.get("nama_pengusul", ""), max_chars=60)
+    kode_wajib = rahasia("kode_usulan")
+    kode = c2.text_input("Kode usulan *", type="password") if kode_wajib else ""
+    hapus = st.toggle("Usulkan berita ini **dihapus** (tidak relevan / ganda)")
+    perubahan = {}
+    if not hapus:
+        a, b, c = st.columns(3)
+        tone = a.selectbox("Tone", TONE, index=TONE.index(r["Tone"]) if r["Tone"] in TONE else 1)
+        opsi = sorted(set(SEMUA["Topik"]) | set(sc.KATA_KUNCI.values()) | {r["Topik"]})
+        topik = b.selectbox("Kata kunci", opsi, index=opsi.index(r["Topik"]), accept_new_options=True)
+        ritel = c.text_input("Seri ritel", r["Ritel"], placeholder="mis. SR025, ST015")
+        with st.expander("Ubah judul, situs, atau tanggal"):
+            judul = st.text_input("Judul", r["Judul"])
+            d1, d2 = st.columns(2)
+            situs = d1.text_input("Situs media", r["Situs"])
+            tgl = d2.date_input("Tanggal", r["Tanggal"].date() if G["pd"].notna(r["Tanggal"]) else None,
+                                format="DD/MM/YYYY")
+        baru = {"Judul": judul, "Situs": situs, "Tanggal": tgl, "Topik": topik or r["Topik"],
+                "Tone": tone, "Ritel": ritel}
+        perubahan = {k: (r[k], baru[k]) for k in us.KOLOM_EDIT}
+    alasan = st.text_area("Alasan / catatan" + (" *" if hapus else " (opsional)"), max_chars=500)
+    if st.button("📨 Kirim usulan", type="primary"):
+        if kode_wajib and not hmac.compare_digest(kode, str(kode_wajib)):
+            st.error("Kode usulan salah.")
+            return
+        if ss.get("n_usulan", 0) >= MAKS_USULAN_PER_SESI:
+            st.error("Batas usulan untuk sesi ini sudah tercapai. Muat ulang halaman untuk lanjut.")
+            return
+        try:
+            uid = us.kirim_usulan(_sheet_usulan(), nama, r["Link"], r["Judul"], perubahan, hapus, alasan)
+        except ValueError as e:
+            st.error(str(e))
+            return
+        except Exception as e:
+            st.error(f"Usulan gagal dikirim: {e}")
+            return
+        ss["nama_pengusul"] = nama.strip()
+        ss["n_usulan"] = ss.get("n_usulan", 0) + 1
+        menunggu_usulan.clear()
+        ss["toast"] = f"Usulan {uid} terkirim dan menunggu persetujuan admin. Terima kasih!"
+        st.rerun()
+
+
+def kartu_usulan(df, kunci, per_halaman=15, edit=True):
+    """Kartu berita dengan tombol ✏️ untuk mengusulkan perubahan."""
+    if df.empty:
+        st.info("Tidak ada berita yang cocok.")
+        return
+    total_hal = max(1, -(-len(df) // per_halaman))
+    hal = 1
+    if total_hal > 1:
+        k = f"pg_{kunci}"
+        if ss.get(k, 1) > total_hal:
+            ss[k] = 1
+        ss.setdefault(k, 1)
+        hal = st.number_input(f"Halaman (dari {total_hal})", 1, total_hal, key=k)
+    menunggu = menunggu_usulan(str(rahasia("id_sheet_usulan")))
+    for i, r in df.iloc[(hal - 1) * per_halaman: hal * per_halaman].iterrows():
+        kartu = G["html_kartu"](r).rstrip()
+        if sc.kunci_link(r["Link"]) in menunggu and kartu.endswith("</div>"):
+            kartu = (kartu[:-len("</div>")] + '<span class="badge b-kosong">⏳ Ada usulan menunggu '
+                     'persetujuan admin</span></div>')
+        c1, c2 = st.columns([24, 1], vertical_alignment="center")
+        c1.markdown(kartu, unsafe_allow_html=True)
+        if c2.button("✏️", key=f"us_{kunci}_{i}", help="Usulkan perubahan untuk berita ini"):
+            dialog_usulan(r.to_dict())
+
+
+# ---------------------------------------------------------------------------
 # SUSUNAN HALAMAN
 # ---------------------------------------------------------------------------
 
@@ -186,6 +293,11 @@ G["daftar_file"] = lambda: []
 G["sumber_data"] = sumber_data_online
 G["tabel_edit"] = tabel_baca
 G["kartu_berita"] = kartu_baca
+USULAN = usulan_aktif()
+if USULAN:
+    G["kartu_berita"] = kartu_usulan
+    G["TEKS_KARTU"] = ("Klik ✏️ di samping kartu untuk mengusulkan koreksi atau penghapusan. "
+                       "Usulan berlaku setelah disetujui admin.")
 
 MENU = G["MENU"]
 MENU_VIEWER = [MENU[1], MENU[2]]          # Dashboard, Ringkasan pimpinan
@@ -215,5 +327,9 @@ with st.sidebar:
         muat_dari_sheet.clear()
         st.rerun()
     st.markdown("### Tentang")
-    st.caption("Versi baca-saja. Koreksi atau penghapusan berita dilakukan oleh tim pengelola "
-               "Direktorat Pembiayaan Syariah.")
+    if USULAN:
+        st.caption("Data hanya diubah oleh tim pengelola Direktorat Pembiayaan Syariah. Usulan "
+                   "koreksi lewat tombol ✏️ ditinjau dulu sebelum diterapkan.")
+    else:
+        st.caption("Versi baca-saja. Koreksi atau penghapusan berita dilakukan oleh tim pengelola "
+                   "Direktorat Pembiayaan Syariah.")
